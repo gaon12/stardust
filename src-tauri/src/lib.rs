@@ -64,6 +64,7 @@ struct CompressionRequest {
     specific_output_path: String,
     new_folder_name: String,
     keep_original: bool,
+    reuse_compressed_path: Option<String>,
     document_options: DocumentCompressionOptions,
 }
 
@@ -76,6 +77,23 @@ struct CompressionResponse {
     saved_bytes: u64,
     discarded: bool,
     messages: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DocumentProbeItem {
+    path: String,
+    name: String,
+    original_bytes: u64,
+    extension: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProbeDocumentsResponse {
+    items: Vec<DocumentProbeItem>,
+    missing_paths: Vec<String>,
+    directory_paths: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -101,6 +119,77 @@ struct ZipEntryData {
 #[tauri::command]
 fn compress_document(request: CompressionRequest) -> Result<CompressionResponse, String> {
     compress_document_impl(request).map_err(map_command_error)
+}
+
+#[tauri::command]
+fn probe_documents(paths: Vec<String>) -> Result<ProbeDocumentsResponse, String> {
+    probe_documents_impl(paths).map_err(map_command_error)
+}
+
+#[tauri::command]
+fn compute_file_hash(path: String) -> Result<String, String> {
+    compute_file_hash_impl(path).map_err(map_command_error)
+}
+
+fn compute_file_hash_impl(path: String) -> Result<String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        bail!("파일을 찾을 수 없습니다.");
+    }
+    let path = PathBuf::from(trimmed);
+    if !path.exists() || !path.is_file() {
+        bail!("파일을 찾을 수 없습니다.");
+    }
+    sha256_file(&path)
+}
+
+fn probe_documents_impl(paths: Vec<String>) -> Result<ProbeDocumentsResponse> {
+    let mut items = Vec::new();
+    let mut missing_paths = Vec::new();
+    let mut directory_paths = Vec::new();
+
+    for raw in paths {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let path = PathBuf::from(trimmed);
+        if !path.exists() {
+            missing_paths.push(trimmed.to_string());
+            continue;
+        }
+        if !path.is_file() {
+            directory_paths.push(trimmed.to_string());
+            continue;
+        }
+
+        let metadata = fs::metadata(&path)
+            .with_context(|| format!("파일 메타데이터 확인 실패: {}", path.display()))?;
+        let name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| anyhow!("파일명을 읽을 수 없습니다: {}", path.display()))?
+            .to_string();
+        let extension = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+
+        items.push(DocumentProbeItem {
+            path: path.to_string_lossy().to_string(),
+            name,
+            original_bytes: metadata.len(),
+            extension,
+        });
+    }
+
+    Ok(ProbeDocumentsResponse {
+        items,
+        missing_paths,
+        directory_paths,
+    })
 }
 
 fn compress_document_impl(request: CompressionRequest) -> Result<CompressionResponse> {
@@ -129,6 +218,58 @@ fn compress_document_impl(request: CompressionRequest) -> Result<CompressionResp
             .with_context(|| format!("출력 폴더를 만들 수 없습니다: {}", parent.display()))?;
     }
 
+    let mut messages = Vec::new();
+
+    if let Some(reuse_path) = request
+        .reuse_compressed_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    {
+        let reuse_path = PathBuf::from(reuse_path);
+        if reuse_path.exists() && reuse_path.is_file() {
+            fs::copy(&reuse_path, &output_path).with_context(|| {
+                format!(
+                    "기존 압축 결과 복사 실패: {} -> {}",
+                    reuse_path.display(),
+                    output_path.display()
+                )
+            })?;
+
+            let compressed_bytes = fs::metadata(&output_path)
+                .with_context(|| format!("복사된 파일 크기 확인 실패: {}", output_path.display()))?
+                .len();
+
+            messages.push("동일 해시 파일이라 기존 압축 결과를 복사해 재사용했습니다.".to_string());
+
+            if compressed_bytes >= original_bytes {
+                let _ = fs::remove_file(&output_path);
+                return Ok(CompressionResponse {
+                    output_path: None,
+                    original_bytes,
+                    compressed_bytes: original_bytes,
+                    saved_bytes: 0,
+                    discarded: true,
+                    messages,
+                });
+            }
+
+            if !request.keep_original && source_path != output_path {
+                fs::remove_file(&source_path)
+                    .with_context(|| format!("원본 파일 삭제 실패: {}", source_path.display()))?;
+            }
+
+            return Ok(CompressionResponse {
+                output_path: Some(output_path.to_string_lossy().to_string()),
+                original_bytes,
+                compressed_bytes,
+                saved_bytes: original_bytes.saturating_sub(compressed_bytes),
+                discarded: false,
+                messages,
+            });
+        }
+    }
+
     fs::copy(&source_path, &output_path).with_context(|| {
         format!(
             "압축 처리용 파일 복사 실패: {} -> {}",
@@ -136,8 +277,6 @@ fn compress_document_impl(request: CompressionRequest) -> Result<CompressionResp
             output_path.display()
         )
     })?;
-
-    let mut messages = Vec::new();
 
     if extension == "pdf" {
         optimize_pdf(&output_path, &request.document_options, &mut messages)?;
@@ -869,8 +1008,13 @@ fn is_not_found_error_text(text: &str) -> bool {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![compress_document])
+        .invoke_handler(tauri::generate_handler![
+            probe_documents,
+            compute_file_hash,
+            compress_document
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

@@ -30,6 +30,8 @@ export type DocumentItem = {
 	type: SupportedExtension;
 	status: FileStatus;
 	progress: number;
+	contentHash?: string;
+	outputPath?: string;
 	compressedBytes?: number;
 	savedBytes?: number;
 	discarded?: boolean;
@@ -99,8 +101,25 @@ export const formatUnsupportedMessage = (names: string[]) => {
 	return `${preview} 외 ${names.length - 3}개 파일은 지원하지 않습니다.`;
 };
 
+export const formatDuplicateMessage = (names: string[]) => {
+	if (names.length === 1) {
+		return `${names[0]} 파일은 이미 목록에 있습니다.`;
+	}
+	if (names.length <= 4) {
+		return `${names.join(", ")} 파일은 이미 목록에 있어 추가하지 않았습니다.`;
+	}
+	const preview = names.slice(0, 3).join(", ");
+	return `${preview} 외 ${names.length - 3}개 파일은 이미 목록에 있어 추가하지 않았습니다.`;
+};
+
 export const getExtension = (name: string) =>
 	name.split(".").pop()?.toLowerCase() ?? "";
+
+export const getFileNameFromPath = (path: string) =>
+	path.split(/[/\\]/).pop() ?? path;
+
+export const normalizePathKey = (path: string) =>
+	path.replace(/\//g, "\\").toLowerCase();
 
 export const isSupportedExtension = (
 	value: string,

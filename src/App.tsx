@@ -1,13 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { openPath } from "@tauri-apps/plugin-opener";
-import {
-	type ChangeEvent,
-	useCallback,
-	useEffect,
-	useMemo,
-	useRef,
-	useState,
-} from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
 	ActionBar,
 	DragOverlay,
@@ -25,14 +19,16 @@ import {
 	type DocumentItem,
 	detectNotFoundError,
 	extractFilePath,
+	formatDuplicateMessage,
 	formatUnsupportedMessage,
 	getAllowedVideoContainers,
-	getExtension,
+	getFileNameFromPath,
 	initialDocuments,
 	isSupportedExtension,
 	type MediaTargetFormat,
 	type NoticeItem,
 	type NoticeKind,
+	normalizePathKey,
 	type OutputMode,
 	type SettingsTab,
 	supportedTypesText,
@@ -49,6 +45,7 @@ type CompressDocumentRequest = {
 	specificOutputPath: string;
 	newFolderName: string;
 	keepOriginal: boolean;
+	reuseCompressedPath?: string | null;
 	documentOptions: {
 		pdfScope: DocumentCompressionScope;
 		pdfMediaFormat: MediaTargetFormat;
@@ -58,6 +55,33 @@ type CompressDocumentRequest = {
 	};
 };
 
+type DocumentProbeItem = {
+	path: string;
+	name: string;
+	originalBytes: number;
+	extension: string;
+};
+
+type ProbeDocumentsResponse = {
+	items: DocumentProbeItem[];
+	missingPaths: string[];
+	directoryPaths: string[];
+};
+
+const DOCUMENT_EXTENSIONS = [
+	"doc",
+	"docx",
+	"xls",
+	"xlsx",
+	"ppt",
+	"pptx",
+	"odf",
+	"odt",
+	"odp",
+	"ods",
+	"pdf",
+];
+
 type CompressDocumentResponse = {
 	outputPath: string | null;
 	originalBytes: number;
@@ -65,6 +89,13 @@ type CompressDocumentResponse = {
 	savedBytes: number;
 	discarded: boolean;
 	messages: string[];
+};
+
+type HashCacheItem = {
+	outputPath: string | null;
+	compressedBytes: number;
+	savedBytes: number;
+	discarded: boolean;
 };
 
 function App() {
@@ -114,14 +145,31 @@ function App() {
 	const [newFolderName, setNewFolderName] = useState("compressed_result");
 	const [keepOriginal, setKeepOriginal] = useState(true);
 
-	const fileInputRef = useRef<HTMLInputElement>(null);
 	const dragDepthRef = useRef(0);
 	const noticeIdRef = useRef(1);
 	const processingLockRef = useRef(false);
+	const processedByHashRef = useRef<Map<string, HashCacheItem>>(new Map());
 
 	const videoContainerOptions = useMemo(
 		() => getAllowedVideoContainers(videoCodec),
 		[videoCodec],
+	);
+	const compressionSignature = useMemo(
+		() =>
+			JSON.stringify({
+				pdfScope,
+				pdfMediaFormat,
+				officeXmlScope,
+				officeXmlMediaFormat,
+				officeBinaryScope,
+			}),
+		[
+			officeBinaryScope,
+			officeXmlMediaFormat,
+			officeXmlScope,
+			pdfMediaFormat,
+			pdfScope,
+		],
 	);
 
 	useEffect(() => {
@@ -147,24 +195,79 @@ function App() {
 		setNotices((previous) => previous.filter((item) => item.id !== id));
 	};
 
-	const appendFiles = useCallback(
-		(incomingFiles: File[]) => {
-			if (incomingFiles.length === 0) {
+	const appendPaths = useCallback(
+		async (incomingPaths: string[]) => {
+			if (incomingPaths.length === 0) {
 				return;
 			}
 
-			const supportedFiles: Array<{
-				file: File;
-				extension: DocumentItem["type"];
-			}> = [];
+			const duplicateNames: string[] = [];
+			const uniqueKeys = new Set<string>();
+			const queuedPaths: string[] = [];
+			const existingKeys = new Set(
+				documents.map((document) => normalizePathKey(document.path)),
+			);
+
+			for (const rawPath of incomingPaths) {
+				const path = rawPath.trim();
+				if (!path) {
+					continue;
+				}
+
+				const key = normalizePathKey(path);
+				if (uniqueKeys.has(key) || existingKeys.has(key)) {
+					duplicateNames.push(getFileNameFromPath(path));
+					continue;
+				}
+
+				uniqueKeys.add(key);
+				queuedPaths.push(path);
+			}
+
+			if (duplicateNames.length > 0) {
+				pushNotice("warning", formatDuplicateMessage(duplicateNames));
+			}
+
+			if (queuedPaths.length === 0) {
+				return;
+			}
+
+			let probe: ProbeDocumentsResponse;
+			try {
+				probe = await invoke<ProbeDocumentsResponse>("probe_documents", {
+					paths: queuedPaths,
+				});
+			} catch {
+				pushNotice("error", "파일 정보를 불러오는 중 오류가 발생했습니다.");
+				return;
+			}
+
+			if (probe.missingPaths.length > 0) {
+				const names = probe.missingPaths.map(getFileNameFromPath);
+				pushNotice("error", `${names.join(", ")} 파일을 찾을 수 없습니다.`);
+			}
+
+			if (probe.directoryPaths.length > 0) {
+				const names = probe.directoryPaths.map(getFileNameFromPath);
+				pushNotice(
+					"warning",
+					`${names.join(", ")} 항목은 폴더라서 추가하지 않았습니다.`,
+				);
+			}
+
+			const supportedItems: Array<
+				DocumentProbeItem & { extension: DocumentItem["type"] }
+			> = [];
 			const unsupportedNames: string[] = [];
 
-			for (const file of incomingFiles) {
-				const extension = getExtension(file.name);
-				if (isSupportedExtension(extension)) {
-					supportedFiles.push({ file, extension });
+			for (const item of probe.items) {
+				if (isSupportedExtension(item.extension)) {
+					supportedItems.push({
+						...item,
+						extension: item.extension,
+					});
 				} else {
-					unsupportedNames.push(file.name);
+					unsupportedNames.push(item.name);
 				}
 			}
 
@@ -172,7 +275,7 @@ function App() {
 				pushNotice("warning", formatUnsupportedMessage(unsupportedNames));
 			}
 
-			if (supportedFiles.length === 0) {
+			if (supportedItems.length === 0) {
 				return;
 			}
 
@@ -182,27 +285,34 @@ function App() {
 						(maxId, item) => Math.max(maxId, item.id),
 						0,
 					) + 1;
-
-				const newItems: DocumentItem[] = supportedFiles.map(
-					({ file, extension }) => {
-						const createdItem: DocumentItem = {
-							id: nextId,
-							name: file.name,
-							path: extractFilePath(file),
-							originalBytes: file.size,
-							type: extension,
-							status: "queued",
-							progress: 0,
-						};
-						nextId += 1;
-						return createdItem;
-					},
+				const existing = new Set(
+					previousDocuments.map((document) => normalizePathKey(document.path)),
 				);
+
+				const newItems: DocumentItem[] = [];
+				for (const item of supportedItems) {
+					const key = normalizePathKey(item.path);
+					if (existing.has(key)) {
+						continue;
+					}
+
+					newItems.push({
+						id: nextId,
+						name: item.name,
+						path: item.path,
+						originalBytes: item.originalBytes,
+						type: item.extension,
+						status: "queued",
+						progress: 0,
+					});
+					existing.add(key);
+					nextId += 1;
+				}
 
 				return [...previousDocuments, ...newItems];
 			});
 		},
-		[pushNotice],
+		[documents, pushNotice],
 	);
 
 	useEffect(() => {
@@ -243,7 +353,19 @@ function App() {
 			event.preventDefault();
 			dragDepthRef.current = 0;
 			setIsFileDragging(false);
-			appendFiles(Array.from(event.dataTransfer?.files ?? []));
+			const droppedPaths = Array.from(event.dataTransfer?.files ?? [])
+				.map((file) => extractFilePath(file))
+				.filter((path) => path.trim().length > 0);
+
+			if (droppedPaths.length === 0) {
+				pushNotice(
+					"error",
+					"드래그한 파일의 경로를 확인할 수 없습니다. 상단 '추가' 버튼을 사용해 주세요.",
+				);
+				return;
+			}
+
+			void appendPaths(droppedPaths);
 		};
 
 		window.addEventListener("dragenter", onDragEnter);
@@ -257,7 +379,7 @@ function App() {
 			window.removeEventListener("dragleave", onDragLeave);
 			window.removeEventListener("drop", onDrop);
 		};
-	}, [appendFiles]);
+	}, [appendPaths, pushNotice]);
 
 	useEffect(() => {
 		if (!isSettingsOpen) {
@@ -314,27 +436,69 @@ function App() {
 			);
 		}, 260);
 
-		const request: CompressDocumentRequest = {
-			path: target.path,
-			outputMode,
-			outputSuffix,
-			specificOutputPath,
-			newFolderName,
-			keepOriginal,
-			documentOptions: {
-				pdfScope,
-				pdfMediaFormat,
-				officeXmlScope,
-				officeXmlMediaFormat,
-				officeBinaryScope,
-			},
-		};
-
 		void (async () => {
 			try {
 				if (!target.path) {
 					throw new Error("파일을 찾을 수 없습니다.");
 				}
+
+				let contentHash = target.contentHash;
+				if (!contentHash) {
+					contentHash = await invoke<string>("compute_file_hash", {
+						path: target.path,
+					});
+					const normalized = contentHash.toLowerCase();
+					contentHash = normalized;
+					setDocuments((previous) =>
+						previous.map((item) =>
+							item.id === target.id
+								? { ...item, contentHash: normalized }
+								: item,
+						),
+					);
+				}
+
+				const cacheKey = `${contentHash}|${compressionSignature}`;
+				const cached = processedByHashRef.current.get(cacheKey);
+
+				if (cached?.discarded) {
+					setDocuments((previous) =>
+						previous.map((item) =>
+							item.id === target.id
+								? {
+										...item,
+										status: "done",
+										progress: 100,
+										compressedBytes: item.originalBytes,
+										savedBytes: 0,
+										discarded: true,
+									}
+								: item,
+						),
+					);
+					pushNotice(
+						"info",
+						`${target.name}: 동일 해시 파일의 기존 결과를 재사용해 압축을 건너뛰었습니다.`,
+					);
+					return;
+				}
+
+				const request: CompressDocumentRequest = {
+					path: target.path,
+					outputMode,
+					outputSuffix,
+					specificOutputPath,
+					newFolderName,
+					keepOriginal,
+					reuseCompressedPath: cached?.outputPath ?? null,
+					documentOptions: {
+						pdfScope,
+						pdfMediaFormat,
+						officeXmlScope,
+						officeXmlMediaFormat,
+						officeBinaryScope,
+					},
+				};
 
 				const result = await invoke<CompressDocumentResponse>(
 					"compress_document",
@@ -351,12 +515,20 @@ function App() {
 									compressedBytes: result.discarded
 										? result.originalBytes
 										: result.compressedBytes,
+									outputPath: result.outputPath ?? undefined,
 									savedBytes: result.savedBytes,
 									discarded: result.discarded,
 								}
 							: item,
 					),
 				);
+
+				processedByHashRef.current.set(cacheKey, {
+					outputPath: result.outputPath,
+					compressedBytes: result.compressedBytes,
+					savedBytes: result.savedBytes,
+					discarded: result.discarded,
+				});
 
 				if (result.discarded) {
 					pushNotice(
@@ -398,6 +570,7 @@ function App() {
 		})();
 	}, [
 		activeProcessId,
+		compressionSignature,
 		documents,
 		isRunning,
 		keepOriginal,
@@ -449,13 +622,29 @@ function App() {
 		[documents],
 	);
 
-	const openFilePicker = () => {
-		fileInputRef.current?.click();
-	};
+	const openFilePicker = async () => {
+		try {
+			const selected = await openDialog({
+				multiple: true,
+				directory: false,
+				filters: [
+					{
+						name: "문서 파일",
+						extensions: DOCUMENT_EXTENSIONS,
+					},
+				],
+			});
+			if (!selected) {
+				return;
+			}
 
-	const onFileInputChange = (event: ChangeEvent<HTMLInputElement>) => {
-		appendFiles(Array.from(event.currentTarget.files ?? []));
-		event.currentTarget.value = "";
+			const selectedPaths = (
+				Array.isArray(selected) ? selected : [selected]
+			).map((value) => String(value));
+			await appendPaths(selectedPaths);
+		} catch {
+			pushNotice("error", "파일 선택 창을 여는 중 오류가 발생했습니다.");
+		}
 	};
 
 	const removeSelectedFile = () => {
@@ -486,6 +675,7 @@ function App() {
 			pushNotice("info", "압축 중에는 모두 제거를 사용할 수 없습니다.");
 			return;
 		}
+		processedByHashRef.current.clear();
 		setIsRunning(false);
 		setDocuments([]);
 		setSelectedId(null);
@@ -552,15 +742,6 @@ function App() {
 
 	return (
 		<div className="app-root" data-theme={theme}>
-			<input
-				ref={fileInputRef}
-				type="file"
-				multiple
-				accept=".doc,.docx,.xls,.xlsx,.ppt,.pptx,.odf,.odt,.odp,.ods,.pdf"
-				onChange={onFileInputChange}
-				className="hidden-input"
-			/>
-
 			<main className="app-shell">
 				<HeaderBar
 					theme={theme}
