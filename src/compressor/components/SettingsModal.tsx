@@ -1,7 +1,16 @@
-import { FolderOpen, ImageIcon, Video, Volume2, X } from "lucide-react";
+import {
+	FileText,
+	FolderOpen,
+	ImageIcon,
+	Video,
+	Volume2,
+	X,
+} from "lucide-react";
 import { useEffect, useRef } from "react";
 import type {
 	AudioMode,
+	DocumentCompressionScope,
+	MediaTargetFormat,
 	OutputMode,
 	SettingsTab,
 	VideoContainer,
@@ -20,6 +29,16 @@ type SettingsModalProps = {
 	onWebpQualityChange: (value: number) => void;
 	imageKeepMetadata: boolean;
 	onImageKeepMetadataChange: (value: boolean) => void;
+	pdfScope: DocumentCompressionScope;
+	onPdfScopeChange: (value: DocumentCompressionScope) => void;
+	pdfMediaFormat: MediaTargetFormat;
+	onPdfMediaFormatChange: (value: MediaTargetFormat) => void;
+	officeXmlScope: DocumentCompressionScope;
+	onOfficeXmlScopeChange: (value: DocumentCompressionScope) => void;
+	officeXmlMediaFormat: MediaTargetFormat;
+	onOfficeXmlMediaFormatChange: (value: MediaTargetFormat) => void;
+	officeBinaryScope: DocumentCompressionScope;
+	onOfficeBinaryScopeChange: (value: DocumentCompressionScope) => void;
 	audioMode: AudioMode;
 	onAudioModeChange: (value: AudioMode) => void;
 	audioBitrate: string;
@@ -60,6 +79,16 @@ function SettingsModal({
 	onWebpQualityChange,
 	imageKeepMetadata,
 	onImageKeepMetadataChange,
+	pdfScope,
+	onPdfScopeChange,
+	pdfMediaFormat,
+	onPdfMediaFormatChange,
+	officeXmlScope,
+	onOfficeXmlScopeChange,
+	officeXmlMediaFormat,
+	onOfficeXmlMediaFormatChange,
+	officeBinaryScope,
+	onOfficeBinaryScopeChange,
 	audioMode,
 	onAudioModeChange,
 	audioBitrate,
@@ -130,6 +159,13 @@ function SettingsModal({
 				<div className="settings-tabs">
 					<button
 						type="button"
+						className={activeTab === "document" ? "active" : ""}
+						onClick={() => onChangeTab("document")}
+					>
+						<FileText size={14} /> 문서
+					</button>
+					<button
+						type="button"
 						className={activeTab === "image" ? "active" : ""}
 						onClick={() => onChangeTab("image")}
 					>
@@ -159,6 +195,124 @@ function SettingsModal({
 				</div>
 
 				<div className="settings-panel">
+					{activeTab === "document" && (
+						<>
+							<article className="format-setting-card">
+								<h3>PDF</h3>
+								<div className="output-options two-up">
+									<label
+										className={`output-option ${pdfScope === "image-only" ? "active" : ""}`}
+									>
+										<input
+											type="radio"
+											name="pdf-scope"
+											checked={pdfScope === "image-only"}
+											onChange={() => onPdfScopeChange("image-only")}
+										/>
+										<span>이미지 중심</span>
+									</label>
+									<label
+										className={`output-option ${pdfScope === "full" ? "active" : ""}`}
+									>
+										<input
+											type="radio"
+											name="pdf-scope"
+											checked={pdfScope === "full"}
+											onChange={() => onPdfScopeChange("full")}
+										/>
+										<span>텍스트/구조 포함</span>
+									</label>
+								</div>
+								<label className="setting-field">
+									<span>내부 이미지 형식</span>
+									<select
+										value={pdfMediaFormat}
+										onChange={(event) =>
+											onPdfMediaFormatChange(
+												event.currentTarget.value as MediaTargetFormat,
+											)
+										}
+									>
+										<option value="keep">원본 유지</option>
+										<option value="jpg">JPG로 통일</option>
+										<option value="png">PNG로 통일</option>
+									</select>
+								</label>
+							</article>
+
+							<article className="format-setting-card">
+								<h3>DOCX/XLSX/PPTX/ODF 계열</h3>
+								<div className="output-options two-up">
+									<label
+										className={`output-option ${officeXmlScope === "image-only" ? "active" : ""}`}
+									>
+										<input
+											type="radio"
+											name="office-xml-scope"
+											checked={officeXmlScope === "image-only"}
+											onChange={() => onOfficeXmlScopeChange("image-only")}
+										/>
+										<span>이미지만 최적화</span>
+									</label>
+									<label
+										className={`output-option ${officeXmlScope === "full" ? "active" : ""}`}
+									>
+										<input
+											type="radio"
+											name="office-xml-scope"
+											checked={officeXmlScope === "full"}
+											onChange={() => onOfficeXmlScopeChange("full")}
+										/>
+										<span>이미지+텍스트 최적화</span>
+									</label>
+								</div>
+								<label className="setting-field">
+									<span>내부 미디어 형식</span>
+									<select
+										value={officeXmlMediaFormat}
+										onChange={(event) =>
+											onOfficeXmlMediaFormatChange(
+												event.currentTarget.value as MediaTargetFormat,
+											)
+										}
+									>
+										<option value="keep">원본 유지</option>
+										<option value="jpg">JPG로 통일</option>
+										<option value="png">PNG로 통일</option>
+									</select>
+								</label>
+							</article>
+
+							<article className="format-setting-card">
+								<h3>DOC/XLS/PPT (구형 바이너리)</h3>
+								<div className="output-options two-up">
+									<label
+										className={`output-option ${officeBinaryScope === "image-only" ? "active" : ""}`}
+									>
+										<input
+											type="radio"
+											name="office-binary-scope"
+											checked={officeBinaryScope === "image-only"}
+											onChange={() => onOfficeBinaryScopeChange("image-only")}
+										/>
+										<span>이미지 중심</span>
+									</label>
+									<label
+										className={`output-option ${officeBinaryScope === "full" ? "active" : ""}`}
+									>
+										<input
+											type="radio"
+											name="office-binary-scope"
+											checked={officeBinaryScope === "full"}
+											onChange={() => onOfficeBinaryScopeChange("full")}
+										/>
+										<span>전체 압축</span>
+									</label>
+								</div>
+							</article>
+						</>
+					)}
+
 					{activeTab === "image" && (
 						<>
 							<div className="format-setting-card">

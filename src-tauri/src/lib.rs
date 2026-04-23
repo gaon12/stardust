@@ -1,11 +1,16 @@
 use anyhow::{anyhow, bail, Context, Result};
 use flate2::read::GzDecoder;
+use image::codecs::jpeg::JpegEncoder;
+use image::codecs::png::{CompressionType, FilterType, PngEncoder};
+use image::{ColorType, DynamicImage, ImageEncoder};
+use lopdf::{Document as PdfDocument, Object as PdfObject, Stream as PdfStream};
 use regex::Regex;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -25,6 +30,31 @@ enum OutputMode {
     NewFolder,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum DocumentCompressionScope {
+    ImageOnly,
+    Full,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum MediaTargetFormat {
+    Keep,
+    Jpg,
+    Png,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DocumentCompressionOptions {
+    pdf_scope: DocumentCompressionScope,
+    pdf_media_format: MediaTargetFormat,
+    office_xml_scope: DocumentCompressionScope,
+    office_xml_media_format: MediaTargetFormat,
+    office_binary_scope: DocumentCompressionScope,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CompressionRequest {
@@ -34,6 +64,7 @@ struct CompressionRequest {
     specific_output_path: String,
     new_folder_name: String,
     keep_original: bool,
+    document_options: DocumentCompressionOptions,
 }
 
 #[derive(Debug, Serialize)]
@@ -44,6 +75,7 @@ struct CompressionResponse {
     compressed_bytes: u64,
     saved_bytes: u64,
     discarded: bool,
+    messages: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -56,6 +88,14 @@ struct GithubAsset {
     name: String,
     browser_download_url: String,
     digest: Option<String>,
+}
+
+struct ZipEntryData {
+    name: String,
+    data: Vec<u8>,
+    is_dir: bool,
+    compression: CompressionMethod,
+    unix_mode: Option<u32>,
 }
 
 #[tauri::command]
@@ -97,12 +137,33 @@ fn compress_document_impl(request: CompressionRequest) -> Result<CompressionResp
         )
     })?;
 
-    if is_xml_container_extension(&extension) {
-        minify_xml_entries_in_zip(&output_path)?;
-    }
+    let mut messages = Vec::new();
 
-    let ect_binary_path = ensure_ect_installed()?;
-    run_ect(&ect_binary_path, &output_path)?;
+    if extension == "pdf" {
+        optimize_pdf(&output_path, &request.document_options, &mut messages)?;
+    } else if is_xml_container_extension(&extension) {
+        optimize_xml_container(
+            &output_path,
+            request.document_options.office_xml_scope,
+            request.document_options.office_xml_media_format,
+            &mut messages,
+        )?;
+        let ect_binary_path = ensure_ect_installed()?;
+        run_ect(&ect_binary_path, &output_path)?;
+    } else if is_legacy_binary_extension(&extension) {
+        match request.document_options.office_binary_scope {
+            DocumentCompressionScope::Full => {
+                let ect_binary_path = ensure_ect_installed()?;
+                run_ect(&ect_binary_path, &output_path)?;
+            }
+            DocumentCompressionScope::ImageOnly => {
+                messages.push(
+                    "구형 바이너리 문서의 이미지 단독 압축은 제한되어 원본을 유지했습니다."
+                        .to_string(),
+                );
+            }
+        }
+    }
 
     let compressed_bytes = fs::metadata(&output_path)
         .with_context(|| format!("압축 결과 파일 크기 확인 실패: {}", output_path.display()))?
@@ -116,6 +177,7 @@ fn compress_document_impl(request: CompressionRequest) -> Result<CompressionResp
             compressed_bytes: original_bytes,
             saved_bytes: 0,
             discarded: true,
+            messages,
         });
     }
 
@@ -130,7 +192,309 @@ fn compress_document_impl(request: CompressionRequest) -> Result<CompressionResp
         compressed_bytes,
         saved_bytes: original_bytes.saturating_sub(compressed_bytes),
         discarded: false,
+        messages,
     })
+}
+
+fn optimize_pdf(
+    target_path: &Path,
+    options: &DocumentCompressionOptions,
+    messages: &mut Vec<String>,
+) -> Result<()> {
+    let mut document = PdfDocument::load(target_path)
+        .with_context(|| format!("PDF 파일 읽기 실패: {}", target_path.display()))?;
+
+    match options.pdf_media_format {
+        MediaTargetFormat::Keep => {}
+        MediaTargetFormat::Jpg => {
+            let converted = convert_pdf_images_to_jpeg(&mut document, 82)?;
+            if converted > 0 {
+                messages.push(format!(
+                    "PDF 내부 이미지 {converted}개를 JPG로 재인코딩했습니다."
+                ));
+            } else {
+                messages.push(
+                    "PDF 이미지 변환 가능한 항목이 없어 원본 이미지를 유지했습니다.".to_string(),
+                );
+            }
+        }
+        MediaTargetFormat::Png => {
+            messages.push(
+                "PDF 내부 이미지를 PNG로 직접 변환하는 방식은 구조 제약이 있어 현재는 지원하지 않습니다."
+                    .to_string(),
+            );
+        }
+    }
+
+    if matches!(options.pdf_scope, DocumentCompressionScope::Full) {
+        let _ = document.prune_objects();
+        document.compress();
+        let _ = document.renumber_objects();
+        document
+            .save(target_path)
+            .with_context(|| format!("PDF 저장 실패: {}", target_path.display()))?;
+    } else {
+        document.compress();
+        document
+            .save(target_path)
+            .with_context(|| format!("PDF 저장 실패: {}", target_path.display()))?;
+    }
+
+    Ok(())
+}
+
+fn convert_pdf_images_to_jpeg(document: &mut PdfDocument, quality: u8) -> Result<usize> {
+    let mut converted = 0;
+
+    for object in document.objects.values_mut() {
+        let PdfObject::Stream(stream) = object else {
+            continue;
+        };
+
+        if !is_pdf_image_stream(stream) {
+            continue;
+        }
+
+        let source_bytes = stream
+            .decompressed_content()
+            .unwrap_or_else(|_| stream.content.clone());
+
+        let Ok(image) = image::load_from_memory(&source_bytes) else {
+            continue;
+        };
+
+        let encoded = encode_as_jpeg(&image, quality)?;
+        stream.content = encoded;
+        stream
+            .dict
+            .set("Filter", PdfObject::Name(b"DCTDecode".to_vec()));
+        let _ = stream.dict.remove(b"DecodeParms");
+        converted += 1;
+    }
+
+    Ok(converted)
+}
+
+fn is_pdf_image_stream(stream: &PdfStream) -> bool {
+    matches!(
+        stream.dict.get(b"Subtype"),
+        Ok(PdfObject::Name(name)) if name.as_slice() == b"Image"
+    )
+}
+
+fn optimize_xml_container(
+    path: &Path,
+    scope: DocumentCompressionScope,
+    media_format: MediaTargetFormat,
+    messages: &mut Vec<String>,
+) -> Result<()> {
+    let input_file =
+        File::open(path).with_context(|| format!("문서 파일 열기 실패: {}", path.display()))?;
+    let mut archive = ZipArchive::new(input_file)
+        .with_context(|| format!("ZIP 구조 읽기 실패: {}", path.display()))?;
+
+    let mut name_map: HashMap<String, String> = HashMap::new();
+    let mut used_names: HashSet<String> = HashSet::new();
+    let mut entries: Vec<ZipEntryData> = Vec::new();
+    let mut converted_images = 0_u32;
+
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index)?;
+        let original_name = entry.name().to_string();
+        let compression = match entry.compression() {
+            CompressionMethod::Stored => CompressionMethod::Deflated,
+            other => other,
+        };
+
+        let mut current = ZipEntryData {
+            name: original_name.clone(),
+            data: Vec::new(),
+            is_dir: entry.is_dir(),
+            compression,
+            unix_mode: entry.unix_mode(),
+        };
+
+        if !entry.is_dir() {
+            entry.read_to_end(&mut current.data)?;
+
+            if media_format != MediaTargetFormat::Keep && is_document_media_entry(&original_name) {
+                if let Some(new_ext) = target_extension(media_format) {
+                    if let Some(converted) = convert_image_data(&current.data, media_format) {
+                        let proposed_name = replace_entry_extension(&original_name, new_ext);
+                        if !used_names.contains(&proposed_name) {
+                            name_map.insert(original_name.clone(), proposed_name.clone());
+                            current.name = proposed_name;
+                        }
+                        current.data = converted;
+                        converted_images += 1;
+                    }
+                }
+            }
+
+            if matches!(scope, DocumentCompressionScope::Full)
+                && is_xml_or_relationship_entry(&current.name)
+            {
+                if let Ok(text) = std::str::from_utf8(&current.data) {
+                    current.data = minify_xml_content(text).into_bytes();
+                }
+            }
+        }
+
+        used_names.insert(current.name.clone());
+        entries.push(current);
+    }
+
+    if !name_map.is_empty() {
+        for entry in &mut entries {
+            if entry.is_dir || !is_reference_text_entry(&entry.name) {
+                continue;
+            }
+            let Ok(text) = std::str::from_utf8(&entry.data) else {
+                continue;
+            };
+
+            let mut updated = text.to_string();
+            for (old_name, new_name) in &name_map {
+                updated = updated.replace(old_name, new_name);
+            }
+            entry.data = updated.into_bytes();
+        }
+    }
+
+    if converted_images > 0 {
+        messages.push(format!(
+            "문서 내부 이미지 {converted_images}개를 {} 형식으로 정규화했습니다.",
+            media_label(media_format)
+        ));
+    }
+
+    let temp_path = path.with_extension("tmpzip");
+    let output_file = File::create(&temp_path)
+        .with_context(|| format!("임시 ZIP 생성 실패: {}", temp_path.display()))?;
+    let mut writer = ZipWriter::new(output_file);
+
+    for entry in entries {
+        let mut options = SimpleFileOptions::default().compression_method(entry.compression);
+        if let Some(mode) = entry.unix_mode {
+            options = options.unix_permissions(mode);
+        }
+
+        if entry.is_dir {
+            writer.add_directory(entry.name, options)?;
+            continue;
+        }
+
+        writer.start_file(entry.name, options)?;
+        writer.write_all(&entry.data)?;
+    }
+
+    writer.finish()?;
+    let _ = fs::remove_file(path);
+    fs::rename(&temp_path, path).with_context(|| {
+        format!(
+            "문서 최적화 결과 반영 실패: {} -> {}",
+            temp_path.display(),
+            path.display()
+        )
+    })?;
+
+    Ok(())
+}
+
+fn convert_image_data(data: &[u8], target_format: MediaTargetFormat) -> Option<Vec<u8>> {
+    let image = image::load_from_memory(data).ok()?;
+    match target_format {
+        MediaTargetFormat::Keep => None,
+        MediaTargetFormat::Jpg => encode_as_jpeg(&image, 82).ok(),
+        MediaTargetFormat::Png => encode_as_png(&image).ok(),
+    }
+}
+
+fn encode_as_jpeg(image: &DynamicImage, quality: u8) -> Result<Vec<u8>> {
+    let mut buffer = Vec::new();
+    let mut encoder = JpegEncoder::new_with_quality(&mut buffer, quality);
+    encoder.encode_image(image).context("JPEG 인코딩 실패")?;
+    Ok(buffer)
+}
+
+fn encode_as_png(image: &DynamicImage) -> Result<Vec<u8>> {
+    let mut cursor = Cursor::new(Vec::new());
+    let rgba8 = image.to_rgba8();
+    let (width, height) = rgba8.dimensions();
+
+    let encoder =
+        PngEncoder::new_with_quality(&mut cursor, CompressionType::Best, FilterType::Adaptive);
+    encoder
+        .write_image(rgba8.as_raw(), width, height, ColorType::Rgba8.into())
+        .context("PNG 인코딩 실패")?;
+
+    Ok(cursor.into_inner())
+}
+
+fn target_extension(media_format: MediaTargetFormat) -> Option<&'static str> {
+    match media_format {
+        MediaTargetFormat::Keep => None,
+        MediaTargetFormat::Jpg => Some("jpg"),
+        MediaTargetFormat::Png => Some("png"),
+    }
+}
+
+fn media_label(media_format: MediaTargetFormat) -> &'static str {
+    match media_format {
+        MediaTargetFormat::Keep => "원본",
+        MediaTargetFormat::Jpg => "JPG",
+        MediaTargetFormat::Png => "PNG",
+    }
+}
+
+fn replace_entry_extension(entry_name: &str, extension: &str) -> String {
+    let path = Path::new(entry_name);
+    let parent = path
+        .parent()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+
+    if parent.is_empty() {
+        format!("{stem}.{extension}")
+    } else {
+        format!("{parent}/{stem}.{extension}")
+    }
+}
+
+fn is_document_media_entry(entry_name: &str) -> bool {
+    let lowered = entry_name.to_ascii_lowercase();
+    if !(lowered.contains("media/") || lowered.contains("pictures/")) {
+        return false;
+    }
+
+    lowered.ends_with(".png")
+        || lowered.ends_with(".jpg")
+        || lowered.ends_with(".jpeg")
+        || lowered.ends_with(".bmp")
+        || lowered.ends_with(".gif")
+        || lowered.ends_with(".webp")
+}
+
+fn is_xml_or_relationship_entry(entry_name: &str) -> bool {
+    let lowered = entry_name.to_ascii_lowercase();
+    lowered.ends_with(".xml") || lowered.ends_with(".rels")
+}
+
+fn is_reference_text_entry(entry_name: &str) -> bool {
+    let lowered = entry_name.to_ascii_lowercase();
+    lowered.ends_with(".xml")
+        || lowered.ends_with(".rels")
+        || lowered.ends_with(".txt")
+        || lowered.ends_with(".rdf")
+}
+
+fn minify_xml_content(content: &str) -> String {
+    let between_tags = Regex::new(r">\s+<").expect("valid regex");
+    between_tags.replace_all(content.trim(), "><").to_string()
 }
 
 fn is_supported_extension(extension: &str) -> bool {
@@ -145,6 +509,10 @@ fn is_xml_container_extension(extension: &str) -> bool {
         extension,
         "docx" | "xlsx" | "pptx" | "odf" | "odt" | "odp" | "ods"
     )
+}
+
+fn is_legacy_binary_extension(extension: &str) -> bool {
+    matches!(extension, "doc" | "xls" | "ppt")
 }
 
 fn build_output_path(source_path: &Path, request: &CompressionRequest) -> Result<PathBuf> {
@@ -205,71 +573,6 @@ fn build_output_path(source_path: &Path, request: &CompressionRequest) -> Result
     }
 
     Ok(output_path)
-}
-
-fn minify_xml_entries_in_zip(path: &Path) -> Result<()> {
-    let input_file =
-        File::open(path).with_context(|| format!("압축 파일 열기 실패: {}", path.display()))?;
-    let mut archive = ZipArchive::new(input_file)
-        .with_context(|| format!("ZIP 구조 읽기 실패: {}", path.display()))?;
-
-    let temp_path = path.with_extension("tmpzip");
-    let output_file = File::create(&temp_path)
-        .with_context(|| format!("임시 ZIP 생성 실패: {}", temp_path.display()))?;
-    let mut writer = ZipWriter::new(output_file);
-
-    for index in 0..archive.len() {
-        let mut entry = archive.by_index(index)?;
-        let entry_name = entry.name().to_string();
-        let mut options =
-            SimpleFileOptions::default().compression_method(match entry.compression() {
-                CompressionMethod::Stored => CompressionMethod::Deflated,
-                other => other,
-            });
-
-        if let Some(mode) = entry.unix_mode() {
-            options = options.unix_permissions(mode);
-        }
-
-        if entry.is_dir() {
-            writer.add_directory(entry_name, options)?;
-            continue;
-        }
-
-        let mut data = Vec::new();
-        entry.read_to_end(&mut data)?;
-
-        if is_xml_entry(&entry_name) {
-            if let Ok(text) = std::str::from_utf8(&data) {
-                data = minify_xml_content(text).into_bytes();
-            }
-        }
-
-        writer.start_file(entry_name, options)?;
-        writer.write_all(&data)?;
-    }
-
-    writer.finish()?;
-    let _ = fs::remove_file(path);
-    fs::rename(&temp_path, path).with_context(|| {
-        format!(
-            "XML 최소화 결과 반영 실패: {} -> {}",
-            temp_path.display(),
-            path.display()
-        )
-    })?;
-
-    Ok(())
-}
-
-fn is_xml_entry(entry_name: &str) -> bool {
-    let lowered = entry_name.to_ascii_lowercase();
-    lowered.ends_with(".xml") || lowered.ends_with(".rels")
-}
-
-fn minify_xml_content(content: &str) -> String {
-    let between_tags = Regex::new(r">\s+<").expect("valid regex");
-    between_tags.replace_all(content.trim(), "><").to_string()
 }
 
 fn run_ect(binary_path: &Path, target_path: &Path) -> Result<()> {

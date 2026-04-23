@@ -21,6 +21,7 @@ import {
 } from "./compressor/components";
 import {
 	type AudioMode,
+	type DocumentCompressionScope,
 	type DocumentItem,
 	detectNotFoundError,
 	extractFilePath,
@@ -29,6 +30,7 @@ import {
 	getExtension,
 	initialDocuments,
 	isSupportedExtension,
+	type MediaTargetFormat,
 	type NoticeItem,
 	type NoticeKind,
 	type OutputMode,
@@ -47,6 +49,13 @@ type CompressDocumentRequest = {
 	specificOutputPath: string;
 	newFolderName: string;
 	keepOriginal: boolean;
+	documentOptions: {
+		pdfScope: DocumentCompressionScope;
+		pdfMediaFormat: MediaTargetFormat;
+		officeXmlScope: DocumentCompressionScope;
+		officeXmlMediaFormat: MediaTargetFormat;
+		officeBinaryScope: DocumentCompressionScope;
+	};
 };
 
 type CompressDocumentResponse = {
@@ -55,6 +64,7 @@ type CompressDocumentResponse = {
 	compressedBytes: number;
 	savedBytes: number;
 	discarded: boolean;
+	messages: string[];
 };
 
 function App() {
@@ -73,13 +83,22 @@ function App() {
 	const [isFileDragging, setIsFileDragging] = useState(false);
 	const [isSettingsOpen, setIsSettingsOpen] = useState(false);
 	const [activeSettingsTab, setActiveSettingsTab] =
-		useState<SettingsTab>("image");
+		useState<SettingsTab>("document");
 	const [notices, setNotices] = useState<NoticeItem[]>([]);
 
 	const [jpegQuality, setJpegQuality] = useState(82);
 	const [pngCompressionLevel, setPngCompressionLevel] = useState(6);
 	const [webpQuality, setWebpQuality] = useState(80);
 	const [imageKeepMetadata, setImageKeepMetadata] = useState(true);
+	const [pdfScope, setPdfScope] = useState<DocumentCompressionScope>("full");
+	const [pdfMediaFormat, setPdfMediaFormat] =
+		useState<MediaTargetFormat>("keep");
+	const [officeXmlScope, setOfficeXmlScope] =
+		useState<DocumentCompressionScope>("full");
+	const [officeXmlMediaFormat, setOfficeXmlMediaFormat] =
+		useState<MediaTargetFormat>("keep");
+	const [officeBinaryScope, setOfficeBinaryScope] =
+		useState<DocumentCompressionScope>("full");
 	const [audioMode, setAudioMode] = useState<AudioMode>("lossy");
 	const [audioBitrate, setAudioBitrate] = useState("192kbps");
 	const [audioLosslessCodec, setAudioLosslessCodec] = useState("flac");
@@ -302,6 +321,13 @@ function App() {
 			specificOutputPath,
 			newFolderName,
 			keepOriginal,
+			documentOptions: {
+				pdfScope,
+				pdfMediaFormat,
+				officeXmlScope,
+				officeXmlMediaFormat,
+				officeBinaryScope,
+			},
 		};
 
 		void (async () => {
@@ -338,6 +364,9 @@ function App() {
 						`${target.name}은(는) 압축 결과가 더 커서 압축본을 폐기했습니다.`,
 					);
 				}
+				for (const message of result.messages) {
+					pushNotice("info", `${target.name}: ${message}`);
+				}
 			} catch (error) {
 				const notFound = detectNotFoundError(error);
 				pushNotice(
@@ -373,8 +402,13 @@ function App() {
 		isRunning,
 		keepOriginal,
 		newFolderName,
+		officeBinaryScope,
+		officeXmlMediaFormat,
+		officeXmlScope,
 		outputMode,
 		outputSuffix,
+		pdfMediaFormat,
+		pdfScope,
 		pushNotice,
 		specificOutputPath,
 	]);
@@ -597,6 +631,16 @@ function App() {
 				onWebpQualityChange={setWebpQuality}
 				imageKeepMetadata={imageKeepMetadata}
 				onImageKeepMetadataChange={setImageKeepMetadata}
+				pdfScope={pdfScope}
+				onPdfScopeChange={setPdfScope}
+				pdfMediaFormat={pdfMediaFormat}
+				onPdfMediaFormatChange={setPdfMediaFormat}
+				officeXmlScope={officeXmlScope}
+				onOfficeXmlScopeChange={setOfficeXmlScope}
+				officeXmlMediaFormat={officeXmlMediaFormat}
+				onOfficeXmlMediaFormatChange={setOfficeXmlMediaFormat}
+				officeBinaryScope={officeBinaryScope}
+				onOfficeBinaryScopeChange={setOfficeBinaryScope}
 				audioMode={audioMode}
 				onAudioModeChange={setAudioMode}
 				audioBitrate={audioBitrate}

@@ -1,11 +1,13 @@
 export type ThemeMode = "light" | "dark";
 export type FileStatus = "done" | "processing" | "queued";
-export type SettingsTab = "image" | "audio" | "video" | "output";
+export type SettingsTab = "document" | "image" | "audio" | "video" | "output";
 export type OutputMode = "suffix" | "folder" | "new-folder";
 export type NoticeKind = "warning" | "error" | "info" | "success";
 export type AudioMode = "lossless" | "lossy";
 export type VideoCodec = "h264" | "h265" | "av1" | "vp9";
 export type VideoContainer = "mp4" | "mkv" | "webm" | "mov";
+export type DocumentCompressionScope = "image-only" | "full";
+export type MediaTargetFormat = "keep" | "jpg" | "png";
 
 export type SupportedExtension =
 	| "doc"
